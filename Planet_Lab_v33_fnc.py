@@ -91,6 +91,7 @@ class PlanetLABResults:
     Lint: float
     Ra: float
     delta_bl: float
+    ledoux_top_height_m: float         # height of Ledoux layer top (m)
 
     # --------------- Planet ----------------
     r_chord_Earth: float
@@ -150,6 +151,7 @@ class PlanetLABResults:
         s.append(f"  RB = {self.RB_km:10.4e} km; RB/Rc = {self.RB_over_Rc:10.4f}")
         s.append(f"  Ra envelope = {self.Ra:10.2e}")
         s.append(f"  delta_boundary_layer (m) = {self.delta_bl:10.3e}")
+        s.append(f"  Ledoux layer top height (m) = {self.ledoux_top_height_m:10.3e}")
         s.append(f"  tau_rcb = {self.tau_rcb:10.2e}")
         s.append(f"  Lint = {self.Lint:10.3e}")
         s.append(f"  Height rcb = {self.rcb_height_km:10.3e} km; Rrcb/Rc = {self.Rrcb_over_Rc:.4f}")
@@ -264,54 +266,159 @@ def _nearest_tkey_index(tkey: int) -> int:
     return k if abs(int(unique_tkey[k]) - tkey) < abs(int(unique_tkey[k-1]) - tkey) else (k - 1)
 
 
-def H2_density(T_target: float, P_target: float) -> float:
-    if not _H2_LOADED:
-        load_H2_table()
+def _bracket_tkey_indices(logT: float):
+    """
+    Return (k_lo, k_hi, w_hi) where k_lo and k_hi are indices into unique_tkey
+    that bracket logT, and w_hi is the linear interpolation weight for k_hi.
 
-    tkey = int(np.rint(np.log10(float(T_target)) * 10.0))
-    k_use = _nearest_tkey_index(tkey)
+    If logT is outside the table range, clamps to the nearest end and returns
+    w_hi = 0 (pure k_lo) or w_hi = 1 (pure k_hi = k_lo+1 at upper end).
+    This replaces the old nearest-neighbor _nearest_tkey_index snap, which
+    caused step-discontinuities in Z and hence jagged density profiles.
+    """
+    # unique_tkey stores rounded 0.1-dex logT keys as integers (logT*10)
+    tkey_float = logT * 10.0          # continuous version of tkey
 
-    i1 = int(slice_start[k_use])
-    i2 = int(slice_end[k_use])
+    k = int(np.searchsorted(unique_tkey, tkey_float, side='right'))
 
-    # monotone P within slice
-    j_local = int(np.searchsorted(P_row[i1:i2], float(P_target), side="left"))
-    if j_local >= (i2 - i1):
-        j_local = (i2 - i1) - 1
-    j = i1 + j_local
+    # clamp to valid bracket
+    if k <= 0:
+        return 0, 0, 0.0
+    if k >= unique_tkey.size:
+        n = unique_tkey.size - 1
+        return n, n, 0.0
 
+    k_lo = k - 1
+    k_hi = k
+
+    tkey_lo = float(unique_tkey[k_lo])
+    tkey_hi = float(unique_tkey[k_hi])
+    span = tkey_hi - tkey_lo
+    if span <= 0.0:
+        return k_lo, k_lo, 0.0
+
+    w_hi = (tkey_float - tkey_lo) / span
+    w_hi = float(np.clip(w_hi, 0.0, 1.0))
+    return k_lo, k_hi, w_hi
+
+
+def _interp_Z_at_slice(k: int, P_target: float) -> float:
+    """
+    For isotherm slice k, look up Z = (molar_mass * P) / (R * T * rho)
+    at P_target by linear interpolation in P within the slice.
+    Returns Z, which is the compressibility factor for H2.
+    """
     molar_mass = 0.002
     Rgas = 8.3145
 
-    P = float(P_row[j])
-    T = float(T_row[j])
-    rho = float(rho_row[j])
+    i1 = int(slice_start[k])
+    i2 = int(slice_end[k])
 
-    Z = (molar_mass * P) / (Rgas * T * rho)
+    P_sl  = P_row[i1:i2]
+    T_sl  = T_row[i1:i2]
+    rho_sl = rho_row[i1:i2]
+
+    j_local = int(np.searchsorted(P_sl, float(P_target), side='left'))
+
+    # clamp: if P_target is beyond table, use edge value (no extrapolation in P)
+    if j_local <= 0:
+        j = i1
+        P_ = float(P_sl[0]);  T_ = float(T_sl[0]);  rho_ = float(rho_sl[0])
+    elif j_local >= len(P_sl):
+        j = i2 - 1
+        P_ = float(P_sl[-1]); T_ = float(T_sl[-1]); rho_ = float(rho_sl[-1])
+    else:
+        # linear interpolation between j_local-1 and j_local in P
+        jlo = j_local - 1
+        jhi = j_local
+        Plo = float(P_sl[jlo]); Phi = float(P_sl[jhi])
+        dP  = Phi - Plo
+        if dP <= 0.0:
+            P_ = float(P_sl[jlo]); T_ = float(T_sl[jlo]); rho_ = float(rho_sl[jlo])
+        else:
+            wp = (float(P_target) - Plo) / dP
+            wp = float(np.clip(wp, 0.0, 1.0))
+            P_   = Plo + wp * (Phi - Plo)
+            T_   = float(T_sl[jlo]) + wp * (float(T_sl[jhi]) - float(T_sl[jlo]))
+            rho_ = float(rho_sl[jlo]) + wp * (float(rho_sl[jhi]) - float(rho_sl[jlo]))
+
+    Z = (molar_mass * P_) / (Rgas * T_ * max(rho_, 1e-30))
     if (not np.isfinite(Z)) or (Z <= 0.0):
         return 1.0
     return float(Z)
 
 
-def grad_H2_Chabrier(T_target: float, P_target: float) -> float:
+def H2_density(T_target: float, P_target: float) -> float:
+    """
+    Return the H2 compressibility factor Z = (mu * P) / (R * T * rho).
+
+    Uses bilinear interpolation in (logT, P) between the two bracketing
+    isotherms in the Chabrier EOS table, replacing the old nearest-neighbour
+    isotherm snap that caused step-discontinuities in rho vs r.
+    """
     if not _H2_LOADED:
         load_H2_table()
 
-    tkey = int(np.rint(np.log10(float(T_target)) * 10.0))
-    k_use = _nearest_tkey_index(tkey)
+    logT = np.log10(float(T_target))
+    k_lo, k_hi, w_hi = _bracket_tkey_indices(logT)
 
-    i1 = int(slice_start[k_use])
-    i2 = int(slice_end[k_use])
+    Z_lo = _interp_Z_at_slice(k_lo, P_target)
+    if k_hi == k_lo:
+        return Z_lo
 
-    j_local = int(np.searchsorted(P_row[i1:i2], float(P_target), side="left"))
-    if j_local >= (i2 - i1):
-        j_local = (i2 - i1) - 1
-    j = i1 + j_local
+    Z_hi = _interp_Z_at_slice(k_hi, P_target)
+    return float((1.0 - w_hi) * Z_lo + w_hi * Z_hi)
 
-    g = float(grad_ad[j])
-    if not np.isfinite(g):
-        return 0.3
-    return g
+
+def _interp_grad_at_slice(k: int, P_target: float) -> float:
+    """
+    For isotherm slice k, return grad_ad at P_target by linear interpolation in P.
+    """
+    i1 = int(slice_start[k])
+    i2 = int(slice_end[k])
+
+    P_sl    = P_row[i1:i2]
+    grad_sl = grad_ad[i1:i2]
+
+    j_local = int(np.searchsorted(P_sl, float(P_target), side='left'))
+
+    if j_local <= 0:
+        g = float(grad_sl[0])
+    elif j_local >= len(P_sl):
+        g = float(grad_sl[-1])
+    else:
+        jlo = j_local - 1
+        jhi = j_local
+        Plo = float(P_sl[jlo]); Phi = float(P_sl[jhi])
+        dP  = Phi - Plo
+        if dP <= 0.0:
+            g = float(grad_sl[jlo])
+        else:
+            wp = float(np.clip((float(P_target) - Plo) / dP, 0.0, 1.0))
+            g  = float(grad_sl[jlo]) + wp * (float(grad_sl[jhi]) - float(grad_sl[jlo]))
+
+    return g if np.isfinite(g) else 0.3
+
+
+def grad_H2_Chabrier(T_target: float, P_target: float) -> float:
+    """
+    Return the adiabatic gradient grad_ad from the Chabrier H2 EOS table,
+    using bilinear interpolation in (logT, P) between bracketing isotherms.
+    Replaces the old nearest-neighbour isotherm snap for consistency with
+    the updated H2_density interpolation.
+    """
+    if not _H2_LOADED:
+        load_H2_table()
+
+    logT = np.log10(float(T_target))
+    k_lo, k_hi, w_hi = _bracket_tkey_indices(logT)
+
+    g_lo = _interp_grad_at_slice(k_lo, P_target)
+    if k_hi == k_lo:
+        return g_lo
+
+    g_hi = _interp_grad_at_slice(k_hi, P_target)
+    return float((1.0 - w_hi) * g_lo + w_hi * g_hi)
 
 
 def rho_gas(P: float, T: float, mw: float) -> float:
@@ -335,6 +442,7 @@ def Planet_LAB(
     mw_silicate_amu=100.0,
     r_main_m=289.0e-12,             # pm → m
     gamma_gas=1.4,
+    gamma_vis_th=1.0,               # T_eddington: kappa_vis / kappa_th
     surface_P_GPa=4.7,
     dTcdP_deg_per_GPa=-600.0,
     tau_critical_chord=1.0,
@@ -454,8 +562,7 @@ def Planet_LAB(
     #%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%#
     #                                          CORE FUNCTIONS
 
-
-    # -------------- FUNCTIONS FOR MgSiO3 melt EOS ------------- #
+# -------------- FUNCTIONS FOR MgSiO3 melt EOS ------------- #
      
 
     # -------------- MgSiO3 melt Adiabatic T ------------- #
@@ -491,15 +598,16 @@ def Planet_LAB(
 
     # -------------------------------------------------------- #
 
-    def compute_T0_potential_from_surface(Psurf, rho_0, Tsurf):
+    def compute_T0_potential_from_surface(Psurf, rho_0, Tsurf, wtfracH2=0.0):
         """
         New: convert a finite-pressure boundary temperature (Tsurf at Psurf)
         into the potential temperature T0 consistent with the adiabat.
         Uses the same EOS and rho_0 as the structure solver.
         Needed to get eta from Tsurf and Psurf for use to get T0.
+        wtfracH2: weight fraction of H2 in the melt (default 0 = pure MgSiO3).
         """
         # density at the boundary using current (provisional) Tsurf
-        rho_surf_SI = EOS_MgSiO3(Psurf, rho_0, Tsurf)  # kg/m^3
+        rho_surf_SI = EOS_MgSiO3(Psurf, rho_0, Tsurf, wtfracH2)  # kg/m^3
         eta_surf     = rho_surf_SI / (rho_0 * 1000.0)  # rho_0 input is g/cc
         return potential_T_from_surface(Tsurf, eta_surf)
 
@@ -536,97 +644,15 @@ def Planet_LAB(
 
     # -------------- FUNCTION FOR MgSiO3 melt EOS ------------- #
      
-    def func_MgSiO3(eta,P,rho_0,T0):
+    def func_MgSiO3(eta, P, rho_0, T0, wtfracH2=0.0):
         """
         P - Vinet EOS function to be minimized in order to solve for MgSiO3
         MELT DENSITY upon adiabatic compression.
-        Here P_GPa is total pressure, both static and thermal combined. 
-        T_S is the temperature along the adiabat, T0 is the potential T at 0 pressure.
-        Based on EOS fit to de Koker and Stixrude (2009) by Wolf (2018). 
-        
-        Solve for MgSiO3 melt density along an adiabat by finding the compression
-        factor η ≡ ρ/ρ₀ that satisfies the total pressure at a given potential
-        temperature T0.
-
-        OVERVIEW
-        --------
-        This function returns the residual of the pressure balance
-            P_target  − [ P_cold(η) + ΔP_E(η,T) + ΔP_S(η,T) ] ,
-        and is intended for use in a root finder (e.g., brentq/newton). The root
-        corresponds to the physically consistent η (and hence ρ = η·ρ₀) at which
-        the Vinet "cold-curve" pressure plus thermal contributions matches the
-        target pressure.
-
-        1) Target Pressure and Units
-           • Input P is in Pa; it is converted to GPa (P_GPa).
-           • ρ₀ is the reference density at zero pressure/temperature consistent
-             with the adopted V₀.
-
-        2) Cold (Elastic) Pressure: Vinet EOS
-           The static (athermal) pressure is evaluated with the Vinet equation of state
-           using η = ρ/ρ₀ = V₀/V and x = (V/V₀)^{1/3} = η^{-1/3}:
-               P_cold(η) = 3 K₀ η^{2/3} (1 − η^{-1/3})
-                            · exp{ (3/2) (K′₀ − 1) (1 − η^{-1/3}) } .
-           Here K₀ (≡ k) and K′₀ (≡ kprime) are the isothermal bulk modulus at reference
-           conditions and its pressure derivative, fitted to MgSiO₃ melt data.
-
-        3) Temperature Along the Adiabat
-           • T_S(η, T0) gives the temperature along the adiabat that emanates from the
-             potential temperature T0 at zero pressure.
-           • A fixed reference adiabat T_0S(η, T_ref) (with T_ref ≈ 3000 K) is used to
-             parameterize thermal coefficients and the Grüneisen function along a
-             representative path.
-
-        4) Thermal Pressure Contributions
-           Thermal effects are split into two terms built on a Mie–Grüneisen-like
-           framework fitted to first-principles data (de Koker & Stixrude 2009) as
-           parameterized by Wolf (2018):
-
-           (a) ΔP_E  — “thermal energy” term at constant V
-               Define the dimensionless thermal deviation
-                   f_T = (T_S/T0)^m − 1 ,   with m = 3/5 .
-               The thermal energy coefficient b(η) (in eV/atom) and its volume
-               derivative b′(η) (in eV·cm⁻³ per atom) are polynomial functions of
-               compression, evaluated at the current trial η with V = V₀/η. The
-               constant-V thermal pressure increment is
-                   ΔP_E = − b′(η) · f_T .
-
-           (b) ΔP_S  — isentropic deviation term along the adiabat
-               Using f_T and its temperature derivatives (evaluated at T_S, T0,
-               and the reference-adiabat T_0S), together with the Grüneisen
-               parameter γ₀^S(η) along the reference adiabat and the per-atom
-               isochoric heat capacity
-                   C_v = b · (∂f_T/∂T)|_{T0S} + (3/2) N k_B  (N = 5 atoms/f.u.),
-               the additional pressure change from following the adiabat is
-                   ΔP_S = [ b′/(m−1) ] · [ T_S (f′_T|_{T0} − f′_T|_{T0S})
-                                          − T0 (f′_T|_{T0} − f′_T|_{T0S}) ]
-                           + γ₀^S C_v (T_S − T0) / V ,
-               with all quantities evaluated self-consistently at the current η
-               (i.e., using V = V₀/η). Both ΔP_E and ΔP_S are converted to GPa.
-
-        5) What the Solver Does
-           The residual returned by this function is
-               func(η) = P_GPa − P_cold(η) − ΔP_E(η,T_S) − ΔP_S(η,T_S) .
-           A root (func = 0) implies that the thermal contributions have been
-           accounted for and the cold-curve compression η is consistent with the
-           specified total pressure P at the adiabatic temperature T_S(η,T0).
-
-        KEY IMPLEMENTATION NOTES
-        ------------------------
-        • V and b′ depend on η: they must be recomputed at each trial η so that
-          ΔP_E and ΔP_S are consistent with the current volume.
-        • γ₀^S(η) is evaluated from a rational approximation in f = ½(η^{2/3} − 1),
-          using parameters (γ₀, ∂γ/∂T) calibrated at the reference adiabat.
-        • Constants are in eV, cm³, and K as appropriate; conversions (e.g.,
-          eV·cm⁻³ → GPa) are applied explicitly.
-        • After the root is found, density follows from ρ = η·ρ₀.
-
-        REFERENCES (for parameterization/strategy)
-        -----------------------------------------
-        • de Koker, N., & Stixrude, L. (2009), Geophys. J. Int. — First-principles
-          thermodynamics of silicate melts.
-        • Wolf, A. S. (2018) — Parameterization of MgSiO₃ melt EOS based on
-          first-principles data (fit used here).
+        wtfracH2: weight fraction of H2 in the melt. Controls kprime via a
+        linear interpolation between pure MgSiO3 (wtfracH2=0, kprime=7.42)
+        and 4 wt% H2 (wtfracH2=0.04, kprime=4.47), extrapolating linearly
+        beyond that range.
+        [rest of docstring unchanged]
         """
         
         P_GPa=P/1.0e9
@@ -640,7 +666,15 @@ def Planet_LAB(
         eVcm3_to_GPa=1.60217e-22 # Convert P in eV/cm^3 to GPa
         Vo=14.74*cm3_per_A3 # units = cm^3/atom, where cm^3/angstroms^3 = 1.0e-24
         k= 9.77 # GPa
-        kprime= 7.42 #
+
+        # kprime: linear in wtfracH2, anchored at two points:
+        #   wtfracH2 = 0.00 -> kprime = 7.42  (pure MgSiO3)
+        #   wtfracH2 = 0.04 -> kprime = 4.47  (4 wt% H2)
+        kprime_pure  = 7.42
+        kprime_4pct  = 4.47
+        kprime = kprime_pure + (kprime_4pct - kprime_pure) * (wtfracH2 / 0.04)
+        #kprime = max(kprime, kprime_4pct)   # floor at 4 wt% anchor: no extrapolation below 4.47
+        #kprime = 7.42
         
         #CURRENT COMPRESSIBILITY FACTOR
         rho = eta*rho_0 # eta is 1/the volumetric compression factor V/Vo, or Vo/V
@@ -714,20 +748,20 @@ def Planet_LAB(
 
     # ---------- MgSiO3 melt density calculation ------------ #
 
-    def EOS_MgSiO3(P,rho_0, T0):
+    def EOS_MgSiO3(P, rho_0, T0, wtfracH2=0.0):
         """
         Returns density of MgSiO3 melt in kg / m^3.
-        In 'structure_ODEs', metal corresponds to layer 1.
-        See Seager et al. (2007)
+        wtfracH2: weight fraction of H2 in the melt (default 0 = pure MgSiO3).
+        kprime varies linearly from 7.42 (pure) to 4.47 (4 wt% H2).
         """
         
-        eta = optimize.root_scalar(func_MgSiO3,bracket=[0.000001,5000.0],args=(P,rho_0,T0),method='brentq')
-        rho=rho_0*eta.root
+        eta = optimize.root_scalar(func_MgSiO3, bracket=[0.000001, 5000.0],
+                                   args=(P, rho_0, T0, wtfracH2), method='brentq')
+        rho = rho_0 * eta.root
         
         return rho*1000 # return density in SI units, kg/m^3
 
     # -------------------------------------------------------- #
-
 
 
     # ---------------- FUNCTIONS FOR METAL EOS --------------- #
@@ -851,7 +885,8 @@ def Planet_LAB(
         apply_mix=False,
         phi_site=0.505,         # fraction of MgSiO3 molar volume for Mg/Fe site, trades off with fe_corr_rho
         fe_state='Fe2+_HS',    # 'Fe2+_HS', 'Fe3+_HS', 'Fe3+_LS'
-        fe_corr_rho=1.0      # empirical correction on Fe component density (from Fe0.66–MgO datum)
+        fe_corr_rho=1.0,     # empirical correction on Fe component density (from Fe0.66–MgO datum)
+        wtfracH2=0.0           # weight fraction of H2 in the melt (passed to EOS_MgSiO3)
     ):
         """
         ODEs:
@@ -860,7 +895,7 @@ def Planet_LAB(
 
         EOS:
           layer==0: metal -> EOS_Metal(P, xrho)
-          layer==1: MgSiO3(+H2 scaffold) -> EOS_MgSiO3(P, rho_0, T0) = ρ12
+          layer==1: MgSiO3(+H2 scaffold) -> EOS_MgSiO3(P, rho_0, T0, wtfracH2) = ρ12
 
         Mixing (single-phase, apply_mix=True):
           Fe component uses Fe-occupied site volume ONLY:
@@ -889,14 +924,14 @@ def Planet_LAB(
             rho = EOS_Metal(P, xrho)
 
         elif layer == 1:
-            rho_12 = EOS_MgSiO3(P, rho_0, T0)  # kg/m^3
+            rho_12 = EOS_MgSiO3(P, rho_0, T0, wtfracH2)  # kg/m^3
 
             if apply_mix and (wFe > 0.0):
                 # reference MgSiO3-only density at this P,T to get Vbar_MgSi
                 MW_sil, MW_H2 = 100.39, 2.01588   # g/mol (for rho_0_mix)
                 rho0sil, rho0H2 = 2.5, 0.09       # g/cc
                 rho0_pure_sil = rho_0_mix(0.0, MW_sil, MW_H2, rho0sil, rho0H2)  # g/cc
-                rho_Si_pure   = EOS_MgSiO3(P, rho0_pure_sil, T0)                # kg/m^3
+                rho_Si_pure   = EOS_MgSiO3(P, rho0_pure_sil, T0, wtfracH2)                # kg/m^3
 
                 Vbar_MgSi = M_MgSiO3 / max(rho_Si_pure, 1e-30)  # m^3/mol
                 alpha = (r_Fe_VI / r_Mg_VI) ** 3
@@ -920,6 +955,7 @@ def Planet_LAB(
 
     def integrate_ODEs(
         Pc, Mp, structure, cmf, cmf_mix, xrho, rho_0, T0,
+        wtfracH2=0.0,
         phi_site=0.505,
         fe_state='Fe2+_HS',
         fe_corr_rho=1.0
@@ -960,7 +996,7 @@ def Planet_LAB(
                 structure_ODEs,
                 [_m_min, _m_max],
                 initial_values,
-                args=(structure[i], xrho, rho_0, T0, cmf_mix, apply_mix, phi_site, fe_state, fe_corr_rho),
+                args=(structure[i], xrho, rho_0, T0, cmf_mix, apply_mix, phi_site, fe_state, fe_corr_rho, wtfracH2),
                 max_step=0.005 * Mp
             )
             initial_values = [sol.y[0, -1], sol.y[1, -1]]
@@ -970,10 +1006,10 @@ def Planet_LAB(
                 rho_val = np.array([EOS_Metal(Pj, xrho) for Pj in sol.y[1, :]])
 
             elif structure[i] == 1:
-                rho_12_arr = np.array([EOS_MgSiO3(Pj, rho_0, T0) for Pj in sol.y[1, :]])
+                rho_12_arr = np.array([EOS_MgSiO3(Pj, rho_0, T0, wtfracH2) for Pj in sol.y[1, :]])
 
                 if apply_mix and (wFe > 0.0):
-                    rho_Si_pure_arr = np.array([EOS_MgSiO3(Pj, rho0_pure_sil, T0) for Pj in sol.y[1, :]])
+                    rho_Si_pure_arr = np.array([EOS_MgSiO3(Pj, rho0_pure_sil, T0, wtfracH2) for Pj in sol.y[1, :]])
                     Vbar_MgSi_arr = M_MgSiO3 / np.maximum(rho_Si_pure_arr, 1e-30)
 
                     alpha = (r_Fe_VI / r_Mg_VI) ** 3
@@ -999,7 +1035,7 @@ def Planet_LAB(
 
     # ----- SOLVE SYSTEM OF EQUATIONS FOR Psurf = 0 ---- #
 
-    def func_MR(Pc, Psurf, Mp, structure, cmf, cmf_mix, xrho,rho_0,T0):
+    def func_MR(Pc, Psurf, Mp, structure, cmf, cmf_mix, xrho, rho_0, T0, wtfracH2=0.0):
         """
         This function returns the surface pressure for a given central 
         pressure, Pc (Pa); planet mass, Mp (kg); core mass-fraction cmf [0,1];
@@ -1012,7 +1048,7 @@ def Planet_LAB(
         #Tref, output = optimize.newton(func_Tref, 100000, args=(Psurf, Mp, structure, cmf, cmf_mix, xrho,rho_0,Pc,T0),
                         #tol=50, maxiter=100, full_output=True, disp=False)
                                      
-        m, r, P, rho, Rcmb = integrate_ODEs(Pc, Mp, structure, cmf, cmf_mix, xrho,rho_0,T0)
+        m, r, P, rho, Rcmb = integrate_ODEs(Pc, Mp, structure, cmf, cmf_mix, xrho, rho_0, T0, wtfracH2)
         
         index_cmb = np.argmax(r > Rcmb)
         index_surf=np.argmax(r)
@@ -1023,7 +1059,7 @@ def Planet_LAB(
 
 
 
-    def solve_for_structure(Mp, cmf, cmf_mix, xrho, rho_0,Tsurf, Psurf, structure=[0,1]):
+    def solve_for_structure(Mp, cmf, cmf_mix, xrho, rho_0, Tsurf, Psurf, structure=[0,1], wtfracH2=0.0):
         """
         This function returns arrays for mass (kg); radius (m); pressure (Pa);
         density (kg / m^3) and T (K) for a planet of mass Mp (kg); core mass-fraction cmf [0,1];
@@ -1043,17 +1079,14 @@ def Planet_LAB(
             cmf = 1.0
 
         # --- NEW: convert boundary T at finite P to potential Tpot ---
-        Tpot = compute_T0_potential_from_surface(Psurf, rho_0, Tsurf)
+        Tpot = compute_T0_potential_from_surface(Psurf, rho_0, Tsurf, wtfracH2)
 
         # calculate central pressure, Pc, such that Psurf = desired value
-        #print('CENTRAL PRESSURE calculations...')
-        Pc, output = optimize.newton(func_MR, 200e9, args=(Psurf, Mp, structure, cmf, cmf_mix, xrho,rho_0,Tpot),
+        Pc, output = optimize.newton(func_MR, 200e9, args=(Psurf, Mp, structure, cmf, cmf_mix, xrho, rho_0, Tpot, wtfracH2),
                                      tol=1.0, maxiter=100, full_output=True, disp=False)
-                        
-        #print('P CENTRAL = %.3f GPa' %(Pc/1.0e9))
 
         # Structure
-        m, r, P, rho, Rcmb = integrate_ODEs(Pc, Mp, structure, cmf, cmf_mix, xrho,rho_0,Tpot)
+        m, r, P, rho, Rcmb = integrate_ODEs(Pc, Mp, structure, cmf, cmf_mix, xrho, rho_0, Tpot, wtfracH2)
         
         # Temperatures
         
@@ -1620,7 +1653,7 @@ def Planet_LAB(
                 warnings.simplefilter("ignore")
                 x1, x2, Tcrest, wt_silicate,wt_atmosphere = subregular(T_test,H2melt,PGPa_cont)
 
-            if x1 <= bulk_xH2:
+            if x1 <= bulk_xH2 <= x2:
                 Tc=T_test
                 print('    found T contact at step ', j)
                 return Tc
@@ -2227,17 +2260,20 @@ def Planet_LAB(
 
     #-------------------------------------------------------------------------------------------------------------
         
-    def T_eddington(tau, T_int, T_eq, gamma=1.0):
+    def T_eddington(tau, T_int, T_eq, gamma=None):
         """
         Guillot (2010) Eq. 27: analytic grey atmosphere with isotropic irradiation.
 
         tau   : IR optical depth (downward from TOA)
         T_int : intrinsic temperature (internal heat flux)
         T_eq  : equilibrium temperature (stellar irradiation)
-        gamma : kappa_vis / kappa_th
+        gamma : kappa_vis / kappa_th.  If None (default), uses the value of
+                gamma_vis_th passed to Planet_LAB.
         """
 
         tau = np.asarray(tau, dtype=float)
+        if gamma is None:
+            gamma = gamma_vis_th
         gamma = float(gamma)
 
         # --- Internal flux term ---
@@ -2676,6 +2712,9 @@ def Planet_LAB(
         # Initialize index for position of the rcb
         i_rcb = None
         
+        # Initialize index for tracking the final Ledoux layer top
+        ledoux_top_i_final = None
+        
         
         print("    len(r_atm) =", len(r), "n =", n)
         drs = np.diff(r)
@@ -3100,6 +3139,9 @@ def Planet_LAB(
                     dlnP_best  = float(ledoux_exit_dlnP_best)
                     dlnmu_best = float(ledoux_exit_dlnmu_best)
                     dlnP_min   = float(ledoux_exit_dlnP_min)
+                    
+                    # Save this as the final Ledoux layer top index
+                    ledoux_top_i_final = i_end
 
                     if dlnP_best > dlnP_min:
 
@@ -3884,6 +3926,12 @@ def Planet_LAB(
         if i_rcb is None:
             i_rcb = i_rcb_analytical
         
+        # Calculate Ledoux layer top height in meters
+        if ledoux_top_i_final is not None:
+            ledoux_top_height_m = r[ledoux_top_i_final] - r[0]  # height above atmosphere base (R_s)
+        else:
+            ledoux_top_height_m = 0.0
+        
         T_upper=T[n-2]
         rj = max(r[best_j], 1e-30)
         Tint_r = Tint * (r[0] / r[n-2])**0.5
@@ -3903,7 +3951,7 @@ def Planet_LAB(
             return T,P,density,mass,mass_cond,dPdr_save,MW_gas,MW_melt,m_molec,k_ratio,\
     mass_H2_atm,mass_H2_cond,x_cond,xH2atmosphere,wt_frac_condensed,k_rad_saved,k_conv_saved,k_cond_saved,\
     k_nc_saved,gradT_saved,\
-    x_inhib,Sgaskg,Smeltkg,S_sys_kg,tau,Tint, i_rcb, Lint, delta_bl
+    x_inhib,Sgaskg,Smeltkg,S_sys_kg,tau,Tint, i_rcb, Lint, delta_bl, ledoux_top_height_m
            
     #--------------------------------------------------------------------------------------------------------
     # FIRST, SEARCH FOR FIRST-CONTACT SOLVUS TEMPERATURE AT SPECIFIED BULK COMPOSITION
@@ -3972,7 +4020,7 @@ def Planet_LAB(
     # 1. CALCULATE THE ATMOSPHERE MODEL
     r_atm = gridding(R_s, rmax, int(nr), sharp)
     T,P,density,mass,mass_cond,dPdr_save,MW_gas,MW_melt,m_molec,k_ratio,mass_H2_atm,mass_H2_cond,x_cond,xH2atmosphere,wt_frac_condensed,\
-    k_rad_saved,k_conv_saved,k_cond_saved,k_nc_saved,gradT_saved,x_inhib,Sgaskg,Smeltkg,S_sys_kg,tau,Tint, i_rcb, Lint, delta_bl =model(2, r_atm, Ra=Ra)
+    k_rad_saved,k_conv_saved,k_cond_saved,k_nc_saved,gradT_saved,x_inhib,Sgaskg,Smeltkg,S_sys_kg,tau,Tint, i_rcb, Lint, delta_bl, ledoux_top_height_m =model(2, r_atm, Ra=Ra)
 
     if (i_rcb is None): # trap the rcb pointer if for some reason not found
         i_rcb = 1
@@ -4035,7 +4083,7 @@ def Planet_LAB(
         
         # RECALCULATE THE ATMOSPHERE MODEL WITH NEW T_contact
         T,P,density,mass,mass_cond,dPdr_save,MW_gas,MW_melt,m_molec,k_ratio,mass_H2_atm,mass_H2_cond,x_cond,xH2atmosphere,wt_frac_condensed,\
-        k_rad_saved,k_conv_saved,k_cond_saved,k_nc_saved,gradT_saved,x_inhib,Sgaskg,Smeltkg,S_sys_kg,tau,Tint,i_rcb, Lint, delta_bl=model(2, r_atm, Ra = Ra,T_contact_in = T_contact, Ps_in = Ps)
+        k_rad_saved,k_conv_saved,k_cond_saved,k_nc_saved,gradT_saved,x_inhib,Sgaskg,Smeltkg,S_sys_kg,tau,Tint,i_rcb, Lint, delta_bl, ledoux_top_height_m=model(2, r_atm, Ra = Ra,T_contact_in = T_contact, Ps_in = Ps)
 
         T0=T_contact
         P_surface=P[0] # Pascal
@@ -4097,7 +4145,7 @@ def Planet_LAB(
     print('')
     print('ATMOSPHERE:')
     T,P,density,mass,mass_cond,dPdr_save,MW_gas,MW_melt,m_molec,k_ratio,mass_H2_atm,mass_H2_cond,x_cond,xH2atmosphere,wt_frac_condensed,\
-    k_rad_saved,k_conv_saved,k_cond_saved,k_nc_saved,gradT_saved,x_inhib,Sgaskg,Smeltkg,S_sys_kg,tau,Tint,i_rcb, Lint, delta_bl=model(2, r_atm, Ra = Ra,T_contact_in = T_contact, Ps_in = Ps)
+    k_rad_saved,k_conv_saved,k_cond_saved,k_nc_saved,gradT_saved,x_inhib,Sgaskg,Smeltkg,S_sys_kg,tau,Tint,i_rcb, Lint, delta_bl, ledoux_top_height_m=model(2, r_atm, Ra = Ra,T_contact_in = T_contact, Ps_in = Ps)
 
 
 
@@ -4194,7 +4242,7 @@ def Planet_LAB(
             T, P, density, mass, mass_cond, dPdr_save, MW_gas, MW_melt, m_molec, k_ratio, \
             mass_H2_atm, mass_H2_cond, x_cond, xH2atmosphere, wt_frac_condensed, \
             k_rad_saved, k_conv_saved, k_cond_saved, k_nc_saved, gradT_saved, \
-            x_inhib, Sgaskg, Smeltkg, S_sys_kg, tau, Tint, i_rcb, Lint, delta_bl = model(2, r_atm, Ra = Ra,T_contact_in = T_contact, Ps_in = Ps)
+            x_inhib, Sgaskg, Smeltkg, S_sys_kg, tau, Tint, i_rcb, Lint, delta_bl, ledoux_top_height_m = model(2, r_atm, Ra = Ra,T_contact_in = T_contact, Ps_in = Ps)
             
             
             # TOTAL PLANET MASS
@@ -4318,7 +4366,7 @@ def Planet_LAB(
         # --- CORE SETUP (rho_0) ---
         rho_0_old = rho_0
         if rho_0_in == 0.0:
-            rho_0 = rho_0_mix(massfracH2_core, MW2, MW1, 2.5, 0.09)
+            rho_0 = rho_0_mix(massfracH2_core, MW2, MW1, 2.5,0.09)
         else:
             rho_0 = rho_0_in
         rho_0 = (rho_0 + rho_0_old) / 2
@@ -4330,7 +4378,8 @@ def Planet_LAB(
         P_surface = P[0]
 
         m4, r4, P4, rho4, Rcmb4, Tcore = solve_for_structure(
-            Mc, cmf, cmf_mix, xrho, rho_0, T0, P_surface, structure)
+            Mc, cmf, cmf_mix, xrho, rho_0, T0, P_surface, structure,
+            wtfracH2=massfracH2_core)
         print('    rho surface = %8.3f g/cm^3' % rho4[-1])
         print('    T surface = %.3f K' % T0)
         
@@ -4366,7 +4415,7 @@ def Planet_LAB(
         T, P, density, mass, mass_cond, dPdr_save, MW_gas, MW_melt, m_molec, k_ratio, \
         mass_H2_atm, mass_H2_cond, x_cond, xH2atmosphere, wt_frac_condensed, \
         k_rad_saved, k_conv_saved, k_cond_saved, k_nc_saved, gradT_saved, \
-        x_inhib, Sgaskg, Smeltkg, S_sys_kg, tau, Tin, i_rcb, Lint, delta_bl = model(2, r_atm, Ra = Ra,T_contact_in = T_contact, Ps_in = Ps)
+        x_inhib, Sgaskg, Smeltkg, S_sys_kg, tau, Tin, i_rcb, Lint, delta_bl, ledoux_top_height_m = model(2, r_atm, Ra = Ra,T_contact_in = T_contact, Ps_in = Ps)
         
         # SAVE ATMOSPHERE MASS
         Matm = mass[n-2]
@@ -5134,6 +5183,7 @@ def Planet_LAB(
         lambda_rcb=lambda_rcb,
         Lint=Lint,
         delta_bl = delta_bl,
+        ledoux_top_height_m=ledoux_top_height_m,
         Ra=Ra,
         # ---- Profiles and files ----
         profiles=profiles,
@@ -5376,6 +5426,7 @@ def legacy_summary_text(res, *, use_color=False) -> str:
     lines.append(f" Trad = {fnum(Trad, '%10.3f')} K")
     lines.append(f" Ra envelope = {fnum(Ra, '%.4e')}")
     lines.append(f" Boundary layer envelope = {fnum(delta_bl, '%.4e')} meters")
+    lines.append(f" Ledoux layer top height = {fnum(getattr(res, 'ledoux_top_height_m', None), '%.4e')} meters")
     lines.append(f" Lint = {fnum(Lint, '%.4e')} W")
 
     # R(1 bar)/Rc is stored as scalar on res
