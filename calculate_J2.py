@@ -98,12 +98,12 @@ SS = {
     'Uranus': dict(
         J2= 3509.291e-6, J2_err=0.412e-6,   # French et al. (2024)
         J4=  -35.522e-6, J4_err=0.466e-6,   # French et al. (2024)
-        M=8.68099e25,  Rp=25559e3, P_rot=17.2400*3600, C=0.2225,
+        M=8.68099e25,  Rp=25559e3, P_rot=17.2400*3600, C=0.2250,
     ),
     'Neptune': dict(
         J2= 3528.91e-6, J2_err=4.14e-6,    # French et al. (2024), renorm. to R_eq=24764 km
         J4=  -35.83e-6, J4_err=10.762e-6,  # observational 1-sigma (Jacobson 2009)
-        M=1.02413e26, Rp=24764e3, P_rot=16.1100*3600, C=0.2315,
+        M=1.02413e26, Rp=24764e3, P_rot=16.1100*3600, C=0.241,
     ),
 }
 
@@ -481,7 +481,7 @@ def make_diagnostic_plots(r_int, rho_int, R_1bar, results, suffix, outdir):
     Neptune differ substantially between authors (Nettelmann+2013,
     Helled+2011, Militzer+2013) and digitising any one would imply
     endorsement of that model's assumptions.  The observable constraints
-    — C/MR² = 0.2315, J2 = 3528.91e-6 — are shown as horizontal lines
+    — C/MR² = 0.241, J2 = 3528.91e-6 — are shown as horizontal lines
     instead.  If you have a digitised published profile, pass it in via
     the optional `ref_profile` argument as a tuple (r_norm, rho_kgm3).
     """
