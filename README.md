@@ -1,4 +1,4 @@
-Planet_Lab_v33_withJ2_Neptune.py requires Planet_Lab_v33_fnc.py, calculate_J2.py file, the various cms functions, and the hydrogen equation of state table. Planet_Lab_v33_withJ2.py is similar, but setup for general use.  The accuracy of the cms run at the end of the model depends on settings for grid resolution.  
+Planet_Lab_v33_withJ2.py requires the core function Planet_Lab_v33_fnc.py, and ancillary functions calculate_J2.py file, the various cms functions, and the hydrogen equation of state table. The accuracy of the cms run at the end of the model depends on settings for grid resolution.  
 
 Run the program from the command line using python3 or similar.  A GUI appears with preset values that can be altered in the various
 input cells.  Start the calculation by clicking [START].  The program iterates to find the solution for a given H2 mass fraction and takes
