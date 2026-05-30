@@ -442,7 +442,6 @@ def Planet_LAB(
     mw_silicate_amu=100.0,
     r_main_m=289.0e-12,             # pm → m
     gamma_gas=1.4,
-    gamma_vis_th=1.0,               # T_eddington: kappa_vis / kappa_th
     surface_P_GPa=4.7,
     dTcdP_deg_per_GPa=-600.0,
     tau_critical_chord=1.0,
@@ -1078,23 +1077,34 @@ def Planet_LAB(
             print("    Warning: You've specified a 1 layer model of metal, but also set a cmf != 1.0. I'll set cmf = 1 for this model.")
             cmf = 1.0
 
-        # --- NEW: convert boundary T at finite P to potential Tpot ---
+        # --- Convert boundary T at finite P to potential Tpot, then CLOSE the
+        #     inversion. The single-shot Tpot only approximately reproduces the
+        #     requested surface temperature, because the eta_surf used to set
+        #     Tpot is evaluated at a provisional surface density; once the
+        #     structure is integrated, the surface eta (and hence the realized
+        #     surface T) drifts from the target. The adiabat T_S_MgSiO3 is ~linear
+        #     in Tpot, so rescaling Tpot by (Tsurf / realized_surface_T) converges
+        #     in 1-2 passes and pins the realized surface temperature to Tsurf.
+        vector_T_S_MgSiO3 = np.vectorize(T_S_MgSiO3)
         Tpot = compute_T0_potential_from_surface(Psurf, rho_0, Tsurf, wtfracH2)
 
-        # calculate central pressure, Pc, such that Psurf = desired value
-        Pc, output = optimize.newton(func_MR, 200e9, args=(Psurf, Mp, structure, cmf, cmf_mix, xrho, rho_0, Tpot, wtfracH2),
-                                     tol=1.0, maxiter=100, full_output=True, disp=False)
-
-        # Structure
-        m, r, P, rho, Rcmb = integrate_ODEs(Pc, Mp, structure, cmf, cmf_mix, xrho, rho_0, Tpot, wtfracH2)
-        
-        # Temperatures
-        
-        eta=rho/(rho_0*1000)
-        
-        # Treat whole body as silicate for initial T estimates
-        vector_T_S_MgSiO3=np.vectorize(T_S_MgSiO3)
-        T=vector_T_S_MgSiO3(eta,Tpot)
+        m = r = P = rho = Rcmb = eta = T = None
+        for _recon in range(6):
+            # central pressure Pc such that surface pressure = Psurf
+            Pc, output = optimize.newton(func_MR, 200e9,
+                                         args=(Psurf, Mp, structure, cmf, cmf_mix, xrho, rho_0, Tpot, wtfracH2),
+                                         tol=1.0, maxiter=100, full_output=True, disp=False)
+            # Structure
+            m, r, P, rho, Rcmb = integrate_ODEs(Pc, Mp, structure, cmf, cmf_mix, xrho, rho_0, Tpot, wtfracH2)
+            # Silicate adiabat temperatures
+            eta = rho / (rho_0 * 1000)
+            T = vector_T_S_MgSiO3(eta, Tpot)
+            Ts_real = float(T[-1])               # realized surface (silicate) temperature
+            if (not np.isfinite(Ts_real)) or (Ts_real <= 0.0):
+                break
+            if abs(Ts_real - Tsurf) <= 0.5:      # realized surface now matches the requested boundary
+                break
+            Tpot *= (Tsurf / Ts_real)            # rescale (adiabat ~ linear in Tpot)
         
         # Replace with iron temperatures in the core as defined by Rcmb
         index_cmb = np.argmax(r > Rcmb)
@@ -2260,20 +2270,17 @@ def Planet_LAB(
 
     #-------------------------------------------------------------------------------------------------------------
         
-    def T_eddington(tau, T_int, T_eq, gamma=None):
+    def T_eddington(tau, T_int, T_eq, gamma=1.0):
         """
         Guillot (2010) Eq. 27: analytic grey atmosphere with isotropic irradiation.
 
         tau   : IR optical depth (downward from TOA)
         T_int : intrinsic temperature (internal heat flux)
         T_eq  : equilibrium temperature (stellar irradiation)
-        gamma : kappa_vis / kappa_th.  If None (default), uses the value of
-                gamma_vis_th passed to Planet_LAB.
+        gamma : kappa_vis / kappa_th
         """
 
         tau = np.asarray(tau, dtype=float)
-        if gamma is None:
-            gamma = gamma_vis_th
         gamma = float(gamma)
 
         # --- Internal flux term ---
@@ -4174,6 +4181,16 @@ def Planet_LAB(
     E_prev          = None      # previous composite error for comparison
     # --------------------------------------------------------
 
+    # --- ADDED: boundary self-consistency (T = T0) control ---
+    # Require the core boundary temperature actually used to build the core (T0_used)
+    # to equal the binodal contact recomputed from that very core, before the outer
+    # loop is allowed to converge. Without this the loop can exit on radius/radiation
+    # alone while the core surface is left stranded off the solvus.
+    T_boundary_accuracy = 5.0   # K; how close T0_used must be to the recomputed contact
+    T0_used     = None          # the boundary T the core was actually built with this pass
+    dT_boundary = float('inf')  # |contact(core(T0_used)) - T0_used|
+    # ---------------------------------------------------------
+
     # Seed "previous" values; these names assumed already exist before loop begins
     T_contact_prev    = T_contact
     T0_prev           = T0
@@ -4380,6 +4397,7 @@ def Planet_LAB(
         m4, r4, P4, rho4, Rcmb4, Tcore = solve_for_structure(
             Mc, cmf, cmf_mix, xrho, rho_0, T0, P_surface, structure,
             wtfracH2=massfracH2_core)
+        T0_used = float(T0)   # boundary temperature this core was actually built with
         print('    rho surface = %8.3f g/cm^3' % rho4[-1])
         print('    T surface = %.3f K' % T0)
         
@@ -4437,6 +4455,14 @@ def Planet_LAB(
         T_contact_try = find_contact_T(Tcrest, (100*massfracH2_core), Ps)
         T_contact_raw = clamp_T_contact(T_contact_try)
         print(' Contact solvus temperature (raw) =', T_contact_raw)
+
+        # --- ADDED: boundary self-consistency residual (T = T0 test) ---
+        # Compare the contact implied by THIS core against the boundary T0 the core
+        # was actually built with. At the true fixed point these are equal.
+        if T0_used is not None:
+            dT_boundary = abs(float(T_contact_raw) - float(T0_used))
+            print('    |contact - T0_used| = %.3f K  (need < %.3f K)' % (dT_boundary, T_boundary_accuracy))
+        # --------------------------------------------------------------
 
         # 2) Smoothed predictor for controllers/diagnostics only (NEVER used as boundary)
         if j_iterate > 0:
@@ -4502,7 +4528,7 @@ def Planet_LAB(
             
             if abs(radtest) < Trad_accuracy:
                 if abs((R_s/R_earth_meters) - R_s_earth_old) < radius_accuracy:
-                    if massfracH2_core >= -0.0005:
+                    if massfracH2_core >= -0.0005 and (dT_boundary < T_boundary_accuracy):
                         # Right before break, snap and FREEZE final values (use RAW contact T)
                         R_s_final       = float(r4[-1])         # raw core radius at convergence (meters)
                         T_contact_final = float(T_contact_raw)  # RAW binodal contact T
@@ -4519,7 +4545,7 @@ def Planet_LAB(
                     abs(save_T_top[j_iterate - 1] - save_T_top[j_iterate-2]) <= Trad_accuracy and
                     abs(save_T_top[j_iterate - 2] - save_T_top[j_iterate-3]) <= Trad_accuracy):
                     if abs((R_s/R_earth_meters) - R_s_earth_old) < radius_accuracy:
-                        if massfracH2_core >= -0.0005:
+                        if massfracH2_core >= -0.0005 and (dT_boundary < T_boundary_accuracy):
                             # Right before break, snap and FREEZE final values (use RAW contact T)
                             R_s_final       = float(r4[-1])         # raw core radius at convergence (meters)
                             T_contact_final = float(T_contact_raw)  # RAW binodal contact T
@@ -4553,6 +4579,21 @@ def Planet_LAB(
         R_s = float(r4[-1])                  # last raw core radius
         T0  = float(T_contact_raw)           # last raw binodal contact T
         P_surface = float(P[0])              # last base pressure
+
+    # --- ADDED: FINAL POLISH ---------------------------------------------------
+    # Rebuild the core once more with its surface boundary set exactly to the
+    # converged binodal contact (T0). Earlier passes hand off the boundary with a
+    # one-iteration lag, so the most recently solved core may still be anchored at
+    # a stale T0; this guarantees the SAVED core has Tcore[-1] == T0 == contact.
+    # (solve_for_structure now closes its own potential-T inversion, so the
+    # realized surface matches the requested T0 to <~1 K.)
+    print('Final core re-solve at boundary T0 = %.3f K (binodal contact)' % float(T0))
+    m4, r4, P4, rho4, Rcmb4, Tcore = solve_for_structure(
+        Mc, cmf, cmf_mix, xrho, rho_0, float(T0), float(P_surface), structure,
+        wtfracH2=massfracH2_core)
+    R_s = float(r4[-1])
+    print('    realized core surface T = %.3f K  (target %.3f K)' % (float(Tcore[-1]), float(T0)))
+    # ---------------------------------------------------------------------------
 
 
     #____________________________________________PLANET MODEL COMPLETE ________________________________________________#
