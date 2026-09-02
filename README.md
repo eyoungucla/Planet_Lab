@@ -6,3 +6,5 @@ a number of minutes to run depending on the system resoures.  Output is sent to 
 
 Output includes a series of .txt files containing the model results and a series of plots, all sent to the output directory.  
 
+The neptune_mcmc_T1bar_Lint.py code uses Planet_Lab_v33_fnc.py to do the MCMC search to identify the best fit for Neptune. 
+
